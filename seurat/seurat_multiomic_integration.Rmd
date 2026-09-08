@@ -1,0 +1,283 @@
+---
+title: "seurat_multiomics"
+author: "Steven Nguyen"
+date: "2026-09-03"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+workflow notes:
+- add rna and atac assay to seurat obj
+- run standard analysis for both
+- run wnn analysis (multimodalneighbors())
+- annotate clusters 
+project the umaps 
+- create violin + coverage plot for some pbmc markers like cd4 and cd8 
+
+
+```{r cars}
+# load libraries 
+library(Seurat)
+library(Signac)
+library(EnsDb.Hsapiens.v86)
+library(AnnotationHub)
+library(GenomeInfoDb)
+library(GenomicRanges)
+library(tidyverse)
+```
+
+```{r}
+# load data 
+data <- Read10X_h5('/Users/stevennguyen/Projects/multiomics_integration/seurat/data/10k_PBMC_Multiome_nextgem_Chromium_Controller_filtered_feature_bc_matrix.h5')
+
+# parse into rna and atac counts matrices
+rna_counts <- data$'Gene Expression' 
+atac_counts <- data$'Peaks'
+```
+
+```{r}
+# create seurat obj with rna assay 
+pbmc <- CreateSeuratObject(
+  counts = rna_counts,
+  assay = "RNA"
+)
+# create metadata for percent mt and rb 
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT")
+pbmc[["percent.rb"]] <- PercentageFeatureSet(pbmc, pattern = "^RP")
+```
+
+```{r}
+# filter atac data to only include peaks in standard chromosomes
+grange.counts <- StringToGRanges(rownames(atac_counts), sep=c(":","-"))
+
+grange.use <- seqnames(grange.counts) %in% standardChromosomes(grange.counts)
+
+# filter
+atac_counts <- atac_counts[as.vector(grange.use),]
+
+# get annotations from genome db 
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotations) <- 'UCSC'
+genome(annotations) <- "hg38"
+```
+
+```{r}
+# path to frag tsv 
+frag_path = '/Users/stevennguyen/Projects/multiomics_integration/seurat/data/10k_PBMC_Multiome_nextgem_Chromium_Controller_atac_fragments.tsv.gz'
+
+# create chromatin assay 
+chrom_assay <- CreateChromatinAssay(
+  counts = atac_counts,
+  sep = c(":","-"),
+  min.cells = 10,
+  fragments = frag_path,
+  genome = "hg38",
+  annotation = annotations
+)
+# add to pbmc 
+pbmc[["ATAC"]] <- chrom_assay
+pbmc
+```
+
+```{r}
+# visualize rna qc metrics
+DefaultAssay(pbmc) <- "RNA"
+VlnPlot(
+  object = pbmc,
+  features = c("nCount_RNA","nFeature_RNA","percent.mt"),
+  assay = "RNA"
+)
+```
+
+```{r}
+# calculate atac qc metrics 
+DefaultAssay(pbmc) <- "ATAC"
+
+pbmc <- NucleosomeSignal(pbmc)
+pbmc <- TSSEnrichment(pbmc)
+
+# blacklist ratio 
+ah = AnnotationHub()
+blacklist_regions <- ah[['AH107305']] 
+pbmc$blacklist_ratio <- FractionCountsInRegion(
+  object = pbmc, 
+  assay = 'ATAC',
+  regions = blacklist_regions
+)
+```
+
+```{r}
+# visualize qc metrics 
+VlnPlot(
+  pbmc, 
+  features = 'nCount_RNA',
+  assay = 'RNA',
+  pt.size = 0.1,
+  ncol = 4,
+  y.max = NA
+  
+)
+```
+
+```{r}
+# filter out low quality cells 
+pbmc <- subset(pbmc,
+  subset = 
+    # ATAC filters
+    nCount_ATAC < 100000 &
+    TSS.enrichment > 3.5 &
+    nucleosome_signal < 2 &
+    blacklist_ratio < 0.01 &
+    
+    # RNA filters 
+    nCount_RNA < 20000 &
+    percent.mt < 25
+)
+pbmc
+```
+
+```{r}
+# run standard rna workflow 
+DefaultAssay(pbmc) <- 'RNA'
+
+pbmc <- NormalizeData(pbmc)
+pbmc <- FindVariableFeatures(pbmc)
+pbmc <- ScaleData(pbmc)
+pbmc <- RunPCA(pbmc)
+pbmc <- RunUMAP(pbmc, dims = 1:50, reduction.name = 'umap.rna', reduction.key = 'rnaUMAP_')
+```
+
+```{r}
+# atac standard workflow
+DefaultAssay(pbmc) <- 'ATAC'
+
+pbmc <- RunTFIDF(pbmc) 
+pbmc <- FindTopFeatures(pbmc, min.cutoff = 'q75')
+pbmc <- RunSVD(pbmc)
+pbmc <- RunUMAP(pbmc, reduction = 'lsi', dims = 2:50, reduction.name = 'umap.atac', reduction.key = 'atacUMAP_')
+```
+
+```{r}
+ # run WNN analysis 
+pbmc <- FindMultiModalNeighbors(pbmc, reduction.list = list("pca", "lsi"), dims.list = list(1:50, 2:50))
+
+pbmc <- RunUMAP(pbmc, nn.name = "weighted.nn", reduction.name = 'umap.wnn', reduction.key = 'wnnUMAP_' )
+
+pbmc <- FindClusters(pbmc, graph.name = "wsnn", algorithm = 3, verbose = FALSE)
+```
+
+```{r}
+# calculate different resolutions
+pbmc <- FindClusters(object = pbmc, graph.name = "wsnn", algorithm = 3, resolution = 0.2)
+pbmc <- FindClusters(object = pbmc, graph.name = "wsnn", algorithm = 3, resolution = 0.5)
+pbmc <- FindClusters(object = pbmc, graph.name = "wsnn", algorithm = 3, resolution = 1.0)
+```
+
+```{r}
+# show umap of rna, atac, and integrated 
+p1 <- DimPlot(pbmc, reduction = "umap.rna", group.by = "wsnn_res.0.8", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("RNA")
+p2 <- DimPlot(pbmc, reduction = "umap.atac", group.by = "wsnn_res.0.8", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("ATAC")
+p3 <- DimPlot(pbmc, reduction = "umap.wnn", group.by = "wsnn_res.0.8", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("WNN")
+p1 + p2 + p3 & NoLegend() & theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# annotate data using supervised mapping pipeline (azimuth) 
+library(AzimuthAPI)
+pbmc <- CloudAzimuth(pbmc)
+```
+
+```{r}
+md <- pbmc[[]]
+tail(colnames(md),8)
+```
+
+```{r}
+# visualize histogram of confidence scores 
+library(ggplot2)
+ggplot(md, aes(x = final_level_confidence)) + geom_histogram(bins = 20, fill = "skyblue") + labs(x = "Softmax probability",
+    y = "Count", title = "Histogram of Softmax Probabilities") + theme_bw()
+```
+
+```{r}
+# filter out cells with low confidence
+pbmc_qc <- subset(pbmc, subset = final_level_confidence > 0.5)
+pbmc_qc
+```
+
+```{r}
+# RunUMAP with azimuth embed reduction
+pbmc_qc <- RunUMAP(pbmc_qc, dims = 1:128, reduction = "azimuth_embed", reduction.name = "umap.azimuth")
+```
+
+```{r}
+# view confidence scores in umap projection
+FeaturePlot(pbmc_qc, features = 'final_level_confidence', reduction = "umap.azimuth")
+```
+
+```{r}
+# create a df that calculates most common cell prediction for each wnn cluster to renameidents
+library(dplyr)
+cluster_to_label <- pbmc_qc@meta.data |>
+  group_by(wsnn_res.0.8, final_level_labels) |>
+  summarise(count = n(), .groups = "drop") |>
+  group_by(wsnn_res.0.8) |>
+  slice_max(order_by = count, n = 1) |>
+  ungroup()
+
+# View the mapping
+cluster_to_label
+```
+
+```{r}
+# rename idents 
+new_cluster_ids <- cluster_to_label$final_level_labels
+names(new_cluster_ids) <- as.character(cluster_to_label$wsnn_res.0.8)
+
+# change idents back to wsnn clusters
+Idents(pbmc_qc) <- as.character(pbmc_qc@meta.data$wsnn_res.0.8)
+
+# renam idents using the df we made 
+pbmc_qc <- RenameIdents(pbmc_qc, new_cluster_ids)
+levels(Idents(pbmc_qc))
+```
+
+```{r}
+# visualize wnn umap with azimuth label predictions 
+DimPlot(pbmc_qc, reduction = "umap.wnn", label = TRUE) + NoLegend()
+```
+
+```{r}
+# visualize plots side by side again with azimuth predictions
+p1 <- DimPlot(pbmc_qc, reduction = "umap.rna", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("RNA")
+p2 <- DimPlot(pbmc_qc, reduction = "umap.atac", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("ATAC")
+p3 <- DimPlot(pbmc_qc, reduction = "umap.wnn", label = TRUE, label.size = 2.5, repel = TRUE) + ggtitle("WNN")
+p1 + p2 + p3 & NoLegend() & theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+# visualize gene expression alongside chromatin accessibility of genes 
+celltype.names <- levels(pbmc_qc)
+tcell.names <- grep("CD4|CD8|Treg", celltype.names,value = TRUE)
+tcells <- subset(pbmc_qc, idents = tcell.names)
+
+# CD8A
+c1 <- CoveragePlot(tcells, region = 'CD8A', features = 'CD8A', assay = 'ATAC', expression.assay = 'RNA', peaks = FALSE)
+
+c2 <- CoveragePlot(tcells, region = 'CD4', features = 'CD4', assay = 'ATAC', expression.assay = 'RNA', peaks = FALSE)
+
+c1+c2
+```
+
+```{r}
+#saveRDS(pbmc_qc, '/Users/stevennguyen/Projects/sc_rnaseq_integration/multiomics_integration/seurat/data/pbmc_qc.rds')
+```
+
+```{r}
+sessionInfo()
+```
+
